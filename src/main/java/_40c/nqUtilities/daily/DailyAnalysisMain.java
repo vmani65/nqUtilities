@@ -1,0 +1,55 @@
+package _40c.nqUtilities.daily;
+
+import _40c.nqUtilities.daily.analysis.PriceMoveAnalyzer;
+import _40c.nqUtilities.daily.analysis.PriceMoveProfile;
+import _40c.nqUtilities.daily.data.TickRepository;
+
+/**
+ * Entry point for the per-day NIFTY-1 tick-behaviour analysis.
+ *
+ * <pre>
+ *   java _40c.nqUtilities.daily.DailyAnalysisMain [dbPath]
+ * </pre>
+ *
+ * <p>Input  : the live nqTicker tick database ({@code dbPath}, defaulting below).<br>
+ * Output : one intelligence profile per trading day (printed as a one-liner), plus a single
+ * merged global profile across the whole capture window — the model a future shredder will
+ * sample from. This is the "test-case" stage: characterise real behaviour; no synthesis yet.
+ */
+public final class DailyAnalysisMain {
+
+    /** Live database written by nqTicker's SqliteTickWriter. */
+    private static final String DEFAULT_DB_PATH = "C:/novaquant/data/sqlite/nifty_ticks.db";
+
+    public static void main(String[] args) {
+        String dbPath = args.length > 0 ? args[0] : DEFAULT_DB_PATH;
+
+        var repository = new TickRepository(dbPath);
+        var analyzer   = new PriceMoveAnalyzer();
+        var runner     = new DailyAnalysisRunner<>(repository, analyzer);
+
+        long t0 = System.nanoTime();
+        var outcomes = runner.run();
+        long wallMs = (System.nanoTime() - t0) / 1_000_000;
+
+        System.out.println("\n=== Per-day profiles (regular session 09:15-15:30 IST) ===");
+        var global = new PriceMoveProfile("ALL DAYS", 0);
+        int ok = 0;
+        for (var o : outcomes) {
+            if (o.ok()) {
+                ok++;
+                System.out.println("  " + o.result().summary());
+                global.merge(o.result());
+            } else {
+                System.out.printf("  %s   FAILED: %s%n", o.date(), o.failure());
+            }
+        }
+
+        System.out.println("\n=== GLOBAL MODEL (merged across all days) ===");
+        System.out.println(global.report());
+
+        System.out.printf("=== Done: %d/%d days ok, wall %dms ===%n", ok, outcomes.size(), wallMs);
+    }
+
+    private DailyAnalysisMain() {}
+}
