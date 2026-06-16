@@ -6,6 +6,8 @@ import _40c.nqUtilities.daily.analysis.PriceMoveProfile;
 import _40c.nqUtilities.daily.data.TickRepository;
 import _40c.nqUtilities.daily.model.DayTicks;
 import _40c.nqUtilities.daily.model.TradingDay;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -28,6 +30,8 @@ import java.util.concurrent.Executors;
  */
 public final class ShredderMain {
 
+    private static final Logger log = LoggerFactory.getLogger(ShredderMain.class);
+
     private static final String DEFAULT_DB_PATH = "C:/novaquant/data/sqlite/nifty_ticks.db";
     private static final int    MAX_DAYS_TO_SCAN = 18;
 
@@ -41,7 +45,7 @@ public final class ShredderMain {
         // ---- select the most recent days and load only their regular session ----
         List<TradingDay> all = repo.discoverTradingDays();
         List<TradingDay> recent = all.subList(Math.max(0, all.size() - MAX_DAYS_TO_SCAN), all.size());
-        System.out.printf("Loading session ticks for the %d most recent days...%n", recent.size());
+        log.info("Loading session ticks for the {} most recent days...", recent.size());
 
         List<DayTicks> loaded;
         try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
@@ -72,8 +76,8 @@ public final class ShredderMain {
         var liveProfile = new PriceMoveProfile("LIVE", 0);
         for (DayTicks dt : selectedDays) liveProfile.merge(analyzer.analyze(dt));
 
-        System.out.printf("Built live model from %d days (%,d distinct changes); shredding %d bars.%n",
-                selectedDays.size(), liveProfile.totalChanges(), barCount);
+        log.info("Built live model from {} days ({} distinct changes); shredding {} bars.",
+                selectedDays.size(), String.format("%,d", liveProfile.totalChanges()), barCount);
 
         // ---- shred every bar; analyze the shredded ticks back into a profile ----
         var model    = TickModel.from(liveProfile);
@@ -91,10 +95,8 @@ public final class ShredderMain {
         }
 
         // ---- report ----
-        System.out.println("\n========== LIVE model ==========");
-        System.out.println(liveProfile.report());
-        System.out.println("========== SHREDDED model ==========");
-        System.out.println(shreddedProfile.report());
+        log.info("========== LIVE model ==========\n{}", liveProfile.report());
+        log.info("========== SHREDDED model ==========\n{}", shreddedProfile.report());
 
         Validation.compare(liveProfile, shreddedProfile);
     }
@@ -134,9 +136,16 @@ public final class ShredderMain {
     /** Side-by-side comparison of the live vs shredded behaviours, with pass/fail flags. */
     private static final class Validation {
 
+        private final StringBuilder sb = new StringBuilder();
+
         static void compare(PriceMoveProfile live, PriceMoveProfile shred) {
-            System.out.println("========== VALIDATION: live vs shredded ==========");
-            System.out.printf("%-34s %12s %12s %10s   %s%n", "metric", "live", "shredded", "Δ%", "");
+            var v = new Validation();
+            v.build(live, shred);
+            log.info("========== VALIDATION: live vs shredded ==========\n{}", v.sb);
+        }
+
+        private void build(PriceMoveProfile live, PriceMoveProfile shred) {
+            sb.append("%-34s %12s %12s %10s   %s%n".formatted("metric", "live", "shredded", "delta", ""));
 
             Histogram lc = live.changesPerMinHist(), sc = shred.changesPerMinHist();
             row("changes/min  median",  lc.percentile(50), sc.percentile(50), 15);
@@ -180,23 +189,23 @@ public final class ShredderMain {
         }
 
         /** Relative-tolerance row. */
-        static void row(String name, double live, double shred, double tolPct) {
+        private void row(String name, double live, double shred, double tolPct) {
             double d = live == 0 ? (shred == 0 ? 0 : 100) : (shred - live) / live * 100.0;
             flagRow(name, live, shred, "%+9.1f%%".formatted(d), Math.abs(d) <= tolPct);
         }
 
         /** Absolute-tolerance row (for near-zero quantities). */
-        static void rowAbs(String name, double live, double shred, double tolAbs) {
+        private void rowAbs(String name, double live, double shred, double tolAbs) {
             flagRow(name, live, shred, "%+9.3f ".formatted(shred - live), Math.abs(shred - live) <= tolAbs);
         }
 
         /** Percentage-point-tolerance row (for rates already in %). */
-        static void rowPP(String name, double live, double shred, double tolPP) {
+        private void rowPP(String name, double live, double shred, double tolPP) {
             flagRow(name, live, shred, "%+8.1fpp".formatted(shred - live), Math.abs(shred - live) <= tolPP);
         }
 
-        static void flagRow(String name, double live, double shred, String delta, boolean ok) {
-            System.out.printf("%-34s %12.2f %12.2f %10s   %s%n", name, live, shred, delta, ok ? "ok" : "OFF");
+        private void flagRow(String name, double live, double shred, String delta, boolean ok) {
+            sb.append("%-34s %12.2f %12.2f %10s   %s%n".formatted(name, live, shred, delta, ok ? "ok" : "OFF"));
         }
     }
 }

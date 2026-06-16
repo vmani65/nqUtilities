@@ -80,7 +80,7 @@ flagging any metric outside tolerance. The closed-loop test (bars aggregated fro
 all metrics; `TickShredder.REVERSAL_BOOST` is the one calibration knob.
 
 ```sh
-java -cp "target/classes;<sqlite-jdbc>.jar" _40c.nqUtilities.daily.shred.ShredderMain [dbPath] [targetBars]
+java -cp "target/classes;$(cat cp.txt)" _40c.nqUtilities.daily.shred.ShredderMain [dbPath] [targetBars]
 ```
 
 A real historical CSV can replace `BarBuilder` as the bar source without touching the shredder.
@@ -94,17 +94,27 @@ A real historical CSV can replace `BarBuilder` as the bar source without touchin
 
 - JDK 21 (virtual threads)
 - Maven 3.x
-- `org.xerial:sqlite-jdbc` (declared in `pom.xml`)
+- `org.xerial:sqlite-jdbc`, `org.slf4j:slf4j-api`, `ch.qos.logback:logback-classic` (all in `pom.xml`)
+
+## Logging
+
+All output goes through SLF4J + Logback (no `System.out`). The console pattern and levels are in
+`src/main/resources/logback.xml`; multi-line reports/tables are logged as a single message.
 
 ## Build & run
 
 ```sh
 mvn -o clean compile
 
+# easiest: let Maven assemble the runtime classpath once
+mvn -o dependency:build-classpath -Dmdep.outputFile=cp.txt -q
+
 # run the per-day analysis (defaults to the live nqTicker DB)
-java -cp "target/classes;<path-to>/sqlite-jdbc-3.53.0.0.jar" \
-     _40c.nqUtilities.daily.DailyAnalysisMain [dbPath]
+java -cp "target/classes;$(cat cp.txt)" _40c.nqUtilities.daily.DailyAnalysisMain [dbPath]
 ```
+
+The runtime classpath needs the sqlite-jdbc, slf4j-api, logback-classic and logback-core jars
+(plus `target/classes`, which holds the compiled code and `logback.xml`).
 
 ## Layout
 

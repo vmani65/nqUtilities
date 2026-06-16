@@ -5,6 +5,8 @@ import _40c.nqUtilities.daily.analysis.DayAnalyzer;
 import _40c.nqUtilities.daily.data.TickRepository;
 import _40c.nqUtilities.daily.model.DayTicks;
 import _40c.nqUtilities.daily.model.TradingDay;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.LocalDate;
 import java.util.Comparator;
@@ -26,6 +28,8 @@ import java.util.concurrent.Future;
  * @param <R> the per-day result type
  */
 public final class DailyAnalysisRunner<R extends AnalysisResult> {
+
+    private static final Logger log = LoggerFactory.getLogger(DailyAnalysisRunner.class);
 
     private final TickRepository  repository;
     private final DayAnalyzer<R>  analyzer;
@@ -50,7 +54,7 @@ public final class DailyAnalysisRunner<R extends AnalysisResult> {
      */
     public List<DayOutcome<R>> run() {
         List<TradingDay> days = repository.discoverTradingDays();
-        System.out.printf("Discovered %d trading days of %s data - spawning one thread each (analyzer: %s)%n",
+        log.info("Discovered {} trading days of {} data - spawning one thread each (analyzer: {})",
                 days.size(), TickRepository.SYMBOL, analyzer.name());
 
         // One virtual thread per day. try-with-resources awaits all tasks on close().

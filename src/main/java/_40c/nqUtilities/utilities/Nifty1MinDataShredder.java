@@ -1,5 +1,8 @@
 package _40c.nqUtilities.utilities;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * Nifty1MinDataShredder
  *
@@ -14,6 +17,8 @@ package _40c.nqUtilities.utilities;
  */
 public class Nifty1MinDataShredder {
 
+    private static final Logger log = LoggerFactory.getLogger(Nifty1MinDataShredder.class);
+
     public static void main(String[] args) {
         if (args.length < 1) {
             printUsage();
@@ -23,14 +28,14 @@ public class Nifty1MinDataShredder {
         String inputFile = args[0];
         String outputDir = args.length > 1 ? args[1] : ".";
 
-        System.out.println("Nifty1MinDataShredder");
-        System.out.println("  input file : " + inputFile);
-        System.out.println("  output dir : " + outputDir);
+        log.info("Nifty1MinDataShredder");
+        log.info("  input file : {}", inputFile);
+        log.info("  output dir : {}", outputDir);
 
         // TODO: implement shredding logic here.
     }
 
     private static void printUsage() {
-        System.out.println("Usage: java _40c.nqUtilities.utilities.Nifty1MinDataShredder <inputFile> [outputDir]");
+        log.info("Usage: java _40c.nqUtilities.utilities.Nifty1MinDataShredder <inputFile> [outputDir]");
     }
 }
