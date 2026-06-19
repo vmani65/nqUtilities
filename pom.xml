@@ -15,14 +15,11 @@
     </properties>
 
     <dependencies>
-        <!-- Read-only access to the live nifty_ticks.db written by nqTicker's SqliteTickWriter -->
         <dependency>
             <groupId>org.xerial</groupId>
             <artifactId>sqlite-jdbc</artifactId>
             <version>3.53.0.0</version>
         </dependency>
-
-        <!-- Logging: SLF4J API + Logback (matches nqTicker) -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
