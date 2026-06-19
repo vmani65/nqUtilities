@@ -1,5 +1,11 @@
 package _40c.nqUtilities.shred;
 
+import org.sqlite.SQLiteConfig;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
@@ -143,5 +149,89 @@ final class BarBuilder {
                                       long prevMinuteEndVol, long lastVolInMin) {
         long traded = prevMinuteEndVol < 0 ? 0 : Math.max(0, lastVolInMin - prevMinuteEndVol);
         return new CandleBar(day.date(), minute, minuteStartMs, o, h, l, c, traded);
+    }
+}
+
+/**
+ * Read-only access to a 1-minute candle database — the Host B input path. Distinct from
+ * {@link TickStore} because the schema differs:
+ * {@code candles(symbol, window_start, window_end, open, high, low, close, volume, tick_count)} with
+ * {@code window_start} = UTC epoch-ms at the start of the minute. Rows are filtered to the regular
+ * session (09:15–15:30 IST), mapped to {@link CandleBar}, and grouped by IST trading day so the
+ * shredder can seed its RNG per day. Opened {@code SQLITE_OPEN_READONLY} (a live gateway may be writing).
+ */
+final class CandleStore {
+
+    private final String jdbcUrl;
+    private final String symbol;
+
+    CandleStore(String dbPath, String symbol) {
+        this.jdbcUrl = "jdbc:sqlite:" + dbPath;
+        this.symbol  = symbol;
+    }
+
+    /**
+     * Loads session candles for this symbol, optionally bounded to the inclusive IST calendar-date
+     * range {@code [fromIst, toIst]} (each {@code yyyy-MM-dd}; blank/null = unbounded) and capped at
+     * {@code maxBars} bars ({@code <= 0} = all). Returns one inner list per IST trading day, days in
+     * ascending order, bars within a day in {@code window_start} order.
+     */
+    List<List<CandleBar>> loadDays(String fromIst, String toIst, int maxBars) {
+        var sql = new StringBuilder(
+                "SELECT window_start, open, high, low, close, volume FROM candles WHERE symbol = ?");
+        Long fromMs = null, toMs = null;
+        if (fromIst != null && !fromIst.isBlank()) {
+            fromMs = LocalDate.parse(fromIst.trim()).toEpochDay() * TradingDay.DAY_MS - TradingDay.IST_OFFSET_MS;
+            sql.append(" AND window_start >= ?");
+        }
+        if (toIst != null && !toIst.isBlank()) {
+            toMs = (LocalDate.parse(toIst.trim()).toEpochDay() + 1) * TradingDay.DAY_MS - TradingDay.IST_OFFSET_MS;
+            sql.append(" AND window_start < ?");
+        }
+        sql.append(" ORDER BY window_start");
+
+        var days = new ArrayList<List<CandleBar>>();
+        List<CandleBar> cur = null;
+        LocalDate curDate = null;
+        int total = 0;
+
+        try (Connection c = openReadOnly();
+             PreparedStatement ps = c.prepareStatement(sql.toString())) {
+            int p = 1;
+            ps.setString(p++, symbol);
+            if (fromMs != null) ps.setLong(p++, fromMs);
+            if (toMs   != null) ps.setLong(p++, toMs);
+            ps.setFetchSize(10_000);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long ws    = rs.getLong(1);
+                    long istMs = ws + TradingDay.IST_OFFSET_MS;
+                    int  sec   = (int) ((istMs % TradingDay.DAY_MS) / 1000);
+                    if (sec < PriceMoveAnalyzer.SESSION_START_SEC || sec >= PriceMoveAnalyzer.SESSION_END_SEC)
+                        continue;
+
+                    LocalDate date = LocalDate.ofEpochDay(istMs / TradingDay.DAY_MS);
+                    var bar = new CandleBar(date, sec / 60, ws,
+                            rs.getDouble(2), rs.getDouble(3), rs.getDouble(4), rs.getDouble(5), rs.getLong(6));
+
+                    if (!date.equals(curDate)) {
+                        cur = new ArrayList<>();
+                        days.add(cur);
+                        curDate = date;
+                    }
+                    cur.add(bar);
+                    if (maxBars > 0 && ++total >= maxBars) break;
+                }
+            }
+        } catch (SQLException e) {
+            throw new TickStore.DataAccessException("Failed to load candles for " + symbol, e);
+        }
+        return days;
+    }
+
+    private Connection openReadOnly() throws SQLException {
+        var cfg = new SQLiteConfig();
+        cfg.setReadOnly(true);
+        return cfg.createConnection(jdbcUrl);
     }
 }

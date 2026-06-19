@@ -1,6 +1,12 @@
 package _40c.nqUtilities.shred;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * Characterises tick-to-tick behaviour for one trading day over the regular session only
@@ -349,5 +355,129 @@ final class PriceMoveProfile {
                     .formatted(sessOpen, sessHigh, sessLow, sessClose, rangePct));
         }
         return sb.toString();
+    }
+
+    // =============================================================================================
+    // Persistence: freeze the whole profile to a portable text file so the intelligence outlives the
+    // tick DB. One self-describing key=value line per field; histogram/stat bins are written via their
+    // own save/restore. Doubles use Double.toString (round-trip exact); the format carries a version.
+
+    private static final String FORMAT_VERSION = "1";
+
+    /**
+     * Writes the complete profile to {@code file} (parent dirs created as needed). Per-day session
+     * O/H/L/C is intentionally omitted — it is meaningless on the merged aggregate and defaults to
+     * NaN on load.
+     */
+    void save(Path file) {
+        var m = new LinkedHashMap<String, String>();
+        m.put("formatVersion", FORMAT_VERSION);
+        m.put("label",         label);
+        m.put("daysCount",     Integer.toString(daysCount));
+
+        m.put("sessionRows",        Long.toString(sessionRows));
+        m.put("totalChanges",       Long.toString(totalChanges));
+        m.put("upChanges",          Long.toString(upChanges));
+        m.put("downChanges",        Long.toString(downChanges));
+        m.put("reversals",          Long.toString(reversals));
+        m.put("sessionMinutes",     Long.toString(sessionMinutes));
+        m.put("smallestMove",       Double.toString(smallestMove));
+        m.put("movesMultipleOf005", Long.toString(movesMultipleOf005));
+        m.put("bucketActiveMin",    longArray(bucketActiveMin));
+        m.put("bucketChanges",      longArray(bucketChanges));
+
+        changesPerMin.save(m, "changesPerMin");
+        absMovePts.save(m, "absMovePts");
+        signedRetBps.save(m, "signedRetBps");
+        absRetBps.save(m, "absRetBps");
+        moveTicks.save(m, "moveTicks");
+        gapMs.save(m, "gapMs");
+        distinctLevelsPerMin.save(m, "distinctLevelsPerMin");
+        volPerMin.save(m, "volPerMin");
+        volPerChange.save(m, "volPerChange");
+        revisitRatio.save(m, "revisitRatio");
+        pathEfficiency.save(m, "pathEfficiency");
+        for (int b = 0; b < 4; b++) {
+            bucketChangesPerMin[b].save(m, "bucketChangesPerMin." + b);
+            bucketAbsRetBps[b].save(m, "bucketAbsRetBps." + b);
+        }
+        writeMap(file, m);
+    }
+
+    /** Reconstructs a profile previously written by {@link #save} — an exact round-trip. */
+    static PriceMoveProfile load(Path file) {
+        Map<String, String> m = readMap(file);
+        var p = new PriceMoveProfile(m.getOrDefault("label", "LIVE"), 0);
+        p.daysCount          = Integer.parseInt(m.get("daysCount"));
+
+        p.sessionRows        = Long.parseLong(m.get("sessionRows"));
+        p.totalChanges       = Long.parseLong(m.get("totalChanges"));
+        p.upChanges          = Long.parseLong(m.get("upChanges"));
+        p.downChanges        = Long.parseLong(m.get("downChanges"));
+        p.reversals          = Long.parseLong(m.get("reversals"));
+        p.sessionMinutes     = Long.parseLong(m.get("sessionMinutes"));
+        p.smallestMove       = Double.parseDouble(m.get("smallestMove"));
+        p.movesMultipleOf005 = Long.parseLong(m.get("movesMultipleOf005"));
+        parseLongArray(m.get("bucketActiveMin"), p.bucketActiveMin);
+        parseLongArray(m.get("bucketChanges"),   p.bucketChanges);
+
+        p.changesPerMin.restore(m, "changesPerMin");
+        p.absMovePts.restore(m, "absMovePts");
+        p.signedRetBps.restore(m, "signedRetBps");
+        p.absRetBps.restore(m, "absRetBps");
+        p.moveTicks.restore(m, "moveTicks");
+        p.gapMs.restore(m, "gapMs");
+        p.distinctLevelsPerMin.restore(m, "distinctLevelsPerMin");
+        p.volPerMin.restore(m, "volPerMin");
+        p.volPerChange.restore(m, "volPerChange");
+        p.revisitRatio.restore(m, "revisitRatio");
+        p.pathEfficiency.restore(m, "pathEfficiency");
+        for (int b = 0; b < 4; b++) {
+            p.bucketChangesPerMin[b].restore(m, "bucketChangesPerMin." + b);
+            p.bucketAbsRetBps[b].restore(m, "bucketAbsRetBps." + b);
+        }
+        return p;
+    }
+
+    private static String longArray(long[] a) {
+        var sb = new StringBuilder();
+        for (int i = 0; i < a.length; i++) {
+            if (i > 0) sb.append(',');
+            sb.append(a[i]);
+        }
+        return sb.toString();
+    }
+
+    private static void parseLongArray(String csv, long[] dest) {
+        String[] parts = csv.split(",");
+        for (int i = 0; i < dest.length && i < parts.length; i++) dest[i] = Long.parseLong(parts[i].trim());
+    }
+
+    private static void writeMap(Path file, Map<String, String> m) {
+        try {
+            if (file.getParent() != null) Files.createDirectories(file.getParent());
+            var sb = new StringBuilder();
+            sb.append("# nqUtilities PriceMoveProfile — frozen tick-behaviour intelligence.\n");
+            sb.append("# Hand-rolled key=value; histogram bins are comma-separated. Do not hand-edit.\n");
+            for (var e : m.entrySet()) sb.append(e.getKey()).append('=').append(e.getValue()).append('\n');
+            Files.writeString(file, sb.toString());
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to save profile to " + file, e);
+        }
+    }
+
+    private static Map<String, String> readMap(Path file) {
+        var m = new LinkedHashMap<String, String>();
+        try {
+            for (String line : Files.readAllLines(file)) {
+                if (line.isBlank() || line.charAt(0) == '#') continue;
+                int eq = line.indexOf('=');
+                if (eq < 0) continue;
+                m.put(line.substring(0, eq), line.substring(eq + 1));
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to load profile from " + file, e);
+        }
+        return m;
     }
 }

@@ -7,3 +7,7 @@ target/
 .idea/
 *.iml
 .vscode/
+
+# generated runtime classpath
+cp.txt
+logs/

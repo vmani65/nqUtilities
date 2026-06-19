@@ -36,14 +36,138 @@ public final class ShredderMain {
 
     public static void main(String[] args) {
         ShredConfig cfg = ShredConfig.load(args.length > 0 ? args[0] : null);
-        log.info("Config: source={} output={} symbol={} days={} targetBars={}",
+        switch (cfg.mode()) {
+            case "learn" -> learn(cfg);
+            case "shred" -> shred(cfg);
+            default      -> selftest(cfg);
+        }
+    }
+
+    // ============================================================================ modes
+
+    /**
+     * <strong>selftest</strong> (default, closed loop): aggregate real ticks into 1-min bars, build
+     * the live model, shred those bars back into ticks, and verify the shredded statistics reproduce
+     * the live ones. Requires the tick DB.
+     */
+    private static void selftest(ShredConfig cfg) {
+        log.info("Mode=selftest  source={} output={} symbol={} days={} targetBars={}",
                 cfg.sourceDb(), cfg.outputDb(), cfg.symbol(), cfg.days(), cfg.targetBars());
 
+        LiveBuild b = buildFromTicks(cfg);
+        log.info("Built live model from {} days ({} distinct changes); shredding {} bars.",
+                b.selectedDays.size(), fmt(b.liveProfile.totalChanges()), b.barCount);
+
+        var shredder     = new TickShredder(TickModel.from(b.liveProfile));
+        var shreddedDays = shredAll(b.allBars, shredder);
+
+        var analyzer        = new PriceMoveAnalyzer();
+        var shreddedProfile = new PriceMoveProfile("SHREDDED", 0);
+        for (DayTicks dt : shreddedDays) shreddedProfile.merge(analyzer.analyze(dt));
+
+        var output = new TickStore(cfg.outputDb(), cfg.symbol());
+        output.resetOutput();
+        long rows = 0;
+        for (DayTicks dt : shreddedDays) rows += output.write(dt);
+
+        log.info("========== LIVE model ==========\n{}", b.liveProfile.report());
+        log.info("========== SHREDDED model ==========\n{}", shreddedProfile.report());
+        Validation.compare(b.liveProfile, shreddedProfile);
+        log.info("Saved {} shredded ticks for {} to {}", fmt(rows), cfg.symbol(), cfg.outputDb());
+    }
+
+    /**
+     * <strong>learn</strong> (Host A): build the live model from the tick DB exactly as selftest does,
+     * then freeze the whole {@link PriceMoveProfile} to {@code model.file}. No shredding. The saved file
+     * is the portable intelligence copied to Host B; a round-trip check confirms it reloads identically.
+     */
+    private static void learn(ShredConfig cfg) {
+        PriceMoveProfile profile;
+        int daysUsed;
+        if ("queue".equals(cfg.sourceType())) {
+            log.info("Mode=learn  source=queue dir={} symbol={} from={} to={} sessionEndSec={} minDistinctPrices={} model={}",
+                    cfg.queueDir(), cfg.symbol(), cfg.from(), cfg.to(), cfg.learnSessionEndSec(),
+                    cfg.minDistinctPrices(), cfg.modelFile());
+            profile = new PriceMoveProfile("LIVE", 0);
+            var analyzer = new PriceMoveAnalyzer();
+            var queue    = new QueueTickSource(cfg.queueDir(), cfg.symbol(),
+                    cfg.minDistinctPrices(), cfg.learnSessionEndSec());
+            daysUsed = queue.forEachDay(cfg.from(), cfg.to(), day -> profile.merge(analyzer.analyze(day)));
+        } else {
+            log.info("Mode=learn  source=sqlite db={} symbol={} days={} targetBars={} model={}",
+                    cfg.sourceDb(), cfg.symbol(), cfg.days(), cfg.targetBars(), cfg.modelFile());
+            LiveBuild b = buildFromTicks(cfg);
+            profile  = b.liveProfile;
+            daysUsed = b.selectedDays.size();
+        }
+
+        log.info("========== LIVE model ==========\n{}", profile.report());
+
+        Path modelFile = Path.of(cfg.modelFile());
+        profile.save(modelFile);
+        log.info("Saved frozen intelligence ({} distinct changes from {} days) to {}",
+                fmt(profile.totalChanges()), daysUsed, modelFile.toAbsolutePath());
+
+        verifyRoundTrip(profile, PriceMoveProfile.load(modelFile));
+    }
+
+    /**
+     * <strong>shred</strong> (Host B): load the frozen model, read 1-min candles from the candle DB,
+     * shred each bar into ticks, write them to the output DB, then validate the shredded statistics
+     * against the <em>frozen</em> baseline — so validation works with no tick DB present.
+     */
+    private static void shred(ShredConfig cfg) {
+        log.info("Mode=shred  model={} candleDb={} candleSymbol={} from={} to={} cap={} output={}",
+                cfg.modelFile(), cfg.candleDb(), cfg.candleSymbol(), cfg.from(), cfg.to(),
+                cfg.targetBars(), cfg.outputDb());
+
+        Path modelFile = Path.of(cfg.modelFile());
+        PriceMoveProfile loaded = PriceMoveProfile.load(modelFile);
+        log.info("Loaded frozen intelligence ({} distinct changes) from {}",
+                fmt(loaded.totalChanges()), modelFile.toAbsolutePath());
+
+        var shredder = new TickShredder(TickModel.from(loaded));
+        var candles  = new CandleStore(cfg.candleDb(), cfg.candleSymbol());
+        List<List<CandleBar>> days = candles.loadDays(cfg.from(), cfg.to(), cfg.targetBars());
+        int barCount = days.stream().mapToInt(List::size).sum();
+        if (barCount == 0) {
+            log.warn("No session candles for symbol={} in range [{}..{}] — nothing to shred.",
+                    cfg.candleSymbol(), cfg.from(), cfg.to());
+            return;
+        }
+        log.info("Loaded {} 1-min bars across {} days; shredding...", fmt(barCount), days.size());
+
+        var shreddedDays = shredAll(days, shredder);
+
+        var output = new TickStore(cfg.outputDb(), cfg.symbol());
+        output.resetOutput();
+        long rows = 0;
+        for (DayTicks dt : shreddedDays) rows += output.write(dt);
+
+        var analyzer        = new PriceMoveAnalyzer();
+        var shreddedProfile = new PriceMoveProfile("SHREDDED", 0);
+        for (DayTicks dt : shreddedDays) shreddedProfile.merge(analyzer.analyze(dt));
+
+        log.info("========== LIVE model (frozen) ==========\n{}", loaded.report());
+        log.info("========== SHREDDED model ==========\n{}", shreddedProfile.report());
+        Validation.compare(loaded, shreddedProfile);
+        log.info("Saved {} shredded ticks for {} to {}", fmt(rows), cfg.symbol(), cfg.outputDb());
+    }
+
+    // ============================================================================ shared steps
+
+    /** Bars/days/profile selected from the tick DB (shared by selftest and learn). */
+    private record LiveBuild(List<DayTicks> selectedDays, List<List<CandleBar>> allBars,
+                             int barCount, PriceMoveProfile liveProfile) {}
+
+    /**
+     * Reads the regular session of the most-recent {@code days}, selects days newest-first until
+     * {@code targetBars} 1-min bars are gathered, and merges those days into the {@code LIVE} profile.
+     */
+    private static LiveBuild buildFromTicks(ShredConfig cfg) {
         var source   = new TickStore(cfg.sourceDb(), cfg.symbol());
-        var output   = new TickStore(cfg.outputDb(), cfg.symbol());
         var analyzer = new PriceMoveAnalyzer();
 
-        // ---- read: load the regular session of the most recent days ----
         List<TradingDay> all    = source.discoverTradingDays();
         List<TradingDay> recent = all.subList(Math.max(0, all.size() - cfg.days()), all.size());
         log.info("Loading session ticks for the {} most recent days of {}...", recent.size(), cfg.symbol());
@@ -61,7 +185,6 @@ public final class ShredderMain {
                     .toList();
         }
 
-        // ---- bars + live model: newest-first until ~targetBars ----
         var selectedDays = new ArrayList<DayTicks>();
         var allBars      = new ArrayList<List<CandleBar>>();
         int barCount = 0;
@@ -76,17 +199,13 @@ public final class ShredderMain {
 
         var liveProfile = new PriceMoveProfile("LIVE", 0);
         for (DayTicks dt : selectedDays) liveProfile.merge(analyzer.analyze(dt));
+        return new LiveBuild(selectedDays, allBars, barCount, liveProfile);
+    }
 
-        log.info("Built live model from {} days ({} distinct changes); shredding {} bars.",
-                selectedDays.size(), String.format("%,d", liveProfile.totalChanges()), barCount);
-
-        // ---- shred every day's bars (parallel), keeping each day's shredded ticks ----
-        var model    = TickModel.from(liveProfile);
-        var shredder = new TickShredder(model);
-
-        List<DayTicks> shreddedDays;
+    /** Shreds every day's bars in parallel into one {@link DayTicks} per day (per-day RNG seed). */
+    private static List<DayTicks> shredAll(List<List<CandleBar>> allBars, TickShredder shredder) {
         try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
-            shreddedDays = allBars.stream()
+            return allBars.stream()
                     .filter(bars -> !bars.isEmpty())
                     .map(bars -> {
                         long seed = bars.get(0).date().toEpochDay() * 1_000_003L + bars.size();
@@ -96,23 +215,31 @@ public final class ShredderMain {
                     .stream().map(ShredderMain::join)
                     .toList();
         }
-
-        // ---- verify: analyse the shredded ticks back into a profile ----
-        var shreddedProfile = new PriceMoveProfile("SHREDDED", 0);
-        for (DayTicks dt : shreddedDays) shreddedProfile.merge(analyzer.analyze(dt));
-
-        // ---- save: write every shredded tick to the output database ----
-        output.resetOutput();
-        long rowsWritten = 0;
-        for (DayTicks dt : shreddedDays) rowsWritten += output.write(dt);
-
-        // ---- report ----
-        log.info("========== LIVE model ==========\n{}", liveProfile.report());
-        log.info("========== SHREDDED model ==========\n{}", shreddedProfile.report());
-        Validation.compare(liveProfile, shreddedProfile);
-        log.info("Saved {} shredded ticks for {} to {}",
-                String.format("%,d", rowsWritten), cfg.symbol(), cfg.outputDb());
     }
+
+    /** Confirms a saved-then-reloaded profile yields identical headline percentiles. */
+    private static void verifyRoundTrip(PriceMoveProfile saved, PriceMoveProfile reloaded) {
+        String[] names = { "absRetBps p50", "absRetBps p90", "absRetBps p99",
+                           "changesPerMin p50", "gapMs p50" };
+        double[] a = { saved.absRetBpsHist().percentile(50), saved.absRetBpsHist().percentile(90),
+                       saved.absRetBpsHist().percentile(99), saved.changesPerMinHist().percentile(50),
+                       saved.gapMsHist().percentile(50) };
+        double[] r = { reloaded.absRetBpsHist().percentile(50), reloaded.absRetBpsHist().percentile(90),
+                       reloaded.absRetBpsHist().percentile(99), reloaded.changesPerMinHist().percentile(50),
+                       reloaded.gapMsHist().percentile(50) };
+        var sb = new StringBuilder("========== ROUND-TRIP CHECK (saved vs reloaded) ==========\n");
+        sb.append("%-22s %12s %12s   %s%n".formatted("metric", "saved", "reloaded", ""));
+        boolean allOk = saved.totalChanges() == reloaded.totalChanges();
+        for (int i = 0; i < names.length; i++) {
+            boolean ok = a[i] == r[i];
+            allOk &= ok;
+            sb.append("%-22s %12.4f %12.4f   %s%n".formatted(names[i], a[i], r[i], ok ? "ok" : "MISMATCH"));
+        }
+        sb.append(allOk ? "round-trip exact" : "round-trip MISMATCH");
+        log.info(sb.toString());
+    }
+
+    private static String fmt(long v) { return String.format("%,d", v); }
 
     /** Shred one day's bars into a single time-ordered {@link DayTicks} (cumulative volume). */
     private static DayTicks shred(List<CandleBar> bars, TickShredder shredder, SplittableRandom rng) {
@@ -159,14 +286,24 @@ public final class ShredderMain {
      * command line is read from disk; otherwise the bundled {@code shred.properties} on the classpath
      * is used. Missing keys take the defaults below, so a partial file (or none) still runs.
      */
-    record ShredConfig(String sourceDb, String outputDb, String symbol, int days, int targetBars) {
+    record ShredConfig(String mode, String sourceType, String sourceDb, String queueDir,
+                       String outputDb, String symbol, int days, int targetBars, String modelFile,
+                       String candleDb, String candleSymbol, String from, String to,
+                       int minDistinctPrices, int learnSessionEndSec) {
 
-        private static final String DEFAULT_SOURCE_DB = "C:/novaquant/data/sqlite/nifty_ticks.db";
+        private static final String DEFAULT_MODE        = "selftest";
+        private static final String DEFAULT_SOURCE_TYPE = "sqlite";
+        private static final String DEFAULT_SOURCE_DB   = "C:/novaquant/data/sqlite/nifty_ticks.db";
+        private static final String DEFAULT_QUEUE_DIR   = "C:/novaquant/data/ticks";
+        private static final int    DEFAULT_MIN_DISTINCT_PRICES = 10;
         private static final String DEFAULT_OUTPUT_DB = "C:/novaquant/data/sqlite/nifty_ticks_shredded.db";
         private static final String DEFAULT_SYMBOL    = "NIFTY-1";
-        private static final int    DEFAULT_DAYS        = 18;
-        private static final int    DEFAULT_TARGET_BARS = 5000;
-        private static final String CLASSPATH_RESOURCE  = "shred.properties";
+        private static final int    DEFAULT_DAYS         = 18;
+        private static final int    DEFAULT_TARGET_BARS  = 5000;
+        private static final String DEFAULT_MODEL_FILE   = "model/nifty1.profile.json";
+        private static final String DEFAULT_CANDLE_DB    = "D:/Softwares/sqlite/nifty.db";
+        private static final String DEFAULT_CANDLE_SYMBOL = "NIFTY";
+        private static final String CLASSPATH_RESOURCE   = "shred.properties";
 
         static ShredConfig load(String path) {
             var props = new Properties();
@@ -184,11 +321,30 @@ public final class ShredderMain {
                 }
             }
             return new ShredConfig(
+                    props.getProperty("mode", DEFAULT_MODE).trim().toLowerCase(),
+                    props.getProperty("source.type", DEFAULT_SOURCE_TYPE).trim().toLowerCase(),
                     props.getProperty("source.db", DEFAULT_SOURCE_DB).trim(),
+                    props.getProperty("queue.dir", DEFAULT_QUEUE_DIR).trim(),
                     props.getProperty("output.db", DEFAULT_OUTPUT_DB).trim(),
                     props.getProperty("symbol", DEFAULT_SYMBOL).trim(),
                     parseInt(props, "days", DEFAULT_DAYS),
-                    parseInt(props, "target.bars", DEFAULT_TARGET_BARS));
+                    parseInt(props, "target.bars", DEFAULT_TARGET_BARS),
+                    props.getProperty("model.file", DEFAULT_MODEL_FILE).trim(),
+                    props.getProperty("candle.db", DEFAULT_CANDLE_DB).trim(),
+                    props.getProperty("candle.symbol", DEFAULT_CANDLE_SYMBOL).trim(),
+                    props.getProperty("from", "").trim(),
+                    props.getProperty("to", "").trim(),
+                    parseInt(props, "learn.min.distinct.prices", DEFAULT_MIN_DISTINCT_PRICES),
+                    parseSecOfDay(props.getProperty("learn.session.end", ""),
+                            PriceMoveAnalyzer.SESSION_END_SEC));
+        }
+
+        /** Parses an {@code HH:mm} IST time to second-of-day; blank/unset returns {@code dflt}. */
+        private static int parseSecOfDay(String v, int dflt) {
+            if (v == null || v.isBlank()) return dflt;
+            String[] p = v.trim().split(":");
+            if (p.length != 2) throw new IllegalArgumentException("learn.session.end must be HH:mm: " + v);
+            return Integer.parseInt(p[0]) * 3600 + Integer.parseInt(p[1]) * 60;
         }
 
         private static int parseInt(Properties props, String key, int dflt) {
