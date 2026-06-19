@@ -1,66 +1,67 @@
-package _40c.nqUtilities.daily.shred;
+package _40c.nqUtilities.shred;
 
-import _40c.nqUtilities.daily.analysis.Histogram;
-import _40c.nqUtilities.daily.analysis.PriceMoveAnalyzer;
-import _40c.nqUtilities.daily.analysis.PriceMoveProfile;
-import _40c.nqUtilities.daily.data.TickRepository;
-import _40c.nqUtilities.daily.model.DayTicks;
-import _40c.nqUtilities.daily.model.TradingDay;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Properties;
 import java.util.SplittableRandom;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
- * Builds the live behavioural model, shreds ~5000 real 1-minute bars into ticks, then validates
- * that the shredded stream reproduces the live model across the <em>full</em> set of behaviours —
- * not just averages.
+ * The application: <strong>read 1-minute bars from a source database, shred them into tick-level
+ * data, verify the shredded ticks reproduce the live behaviour metrics, and save them to a new
+ * database</strong>.
  *
  * <pre>
- *   java _40c.nqUtilities.daily.shred.ShredderMain [dbPath] [targetBars]
+ *   java _40c.nqUtilities.shred.ShredderMain [configFile]
  * </pre>
  *
- * <p>Closed-loop test: the bars are aggregated from real NIFTY-1 session ticks, so a faithful
- * shredder must regenerate the same tick statistics those bars came from.
+ * <p>Pipeline: read ({@link TickStore}) → model ({@link PriceMoveAnalyzer} → {@link TickModel}) →
+ * bars ({@link BarBuilder}) → shred ({@link TickShredder}) → verify ({@link Validation}) → save
+ * ({@link TickStore#write}). Because the bars are aggregated from real session ticks, this is a
+ * closed-loop test: a faithful shredder must regenerate the same statistics the bars came from.
  */
 public final class ShredderMain {
 
     private static final Logger log = LoggerFactory.getLogger(ShredderMain.class);
 
-    private static final String DEFAULT_DB_PATH = "C:/novaquant/data/sqlite/nifty_ticks.db";
-    private static final int    MAX_DAYS_TO_SCAN = 18;
+    public static void main(String[] args) {
+        ShredConfig cfg = ShredConfig.load(args.length > 0 ? args[0] : null);
+        log.info("Config: source={} output={} symbol={} days={} targetBars={}",
+                cfg.sourceDb(), cfg.outputDb(), cfg.symbol(), cfg.days(), cfg.targetBars());
 
-    public static void main(String[] args) throws Exception {
-        String dbPath     = args.length > 0 ? args[0] : DEFAULT_DB_PATH;
-        int    targetBars = args.length > 1 ? Integer.parseInt(args[1]) : 5000;
-
-        var repo     = new TickRepository(dbPath);
+        var source   = new TickStore(cfg.sourceDb(), cfg.symbol());
+        var output   = new TickStore(cfg.outputDb(), cfg.symbol());
         var analyzer = new PriceMoveAnalyzer();
 
-        // ---- select the most recent days and load only their regular session ----
-        List<TradingDay> all = repo.discoverTradingDays();
-        List<TradingDay> recent = all.subList(Math.max(0, all.size() - MAX_DAYS_TO_SCAN), all.size());
-        log.info("Loading session ticks for the {} most recent days...", recent.size());
+        // ---- read: load the regular session of the most recent days ----
+        List<TradingDay> all    = source.discoverTradingDays();
+        List<TradingDay> recent = all.subList(Math.max(0, all.size() - cfg.days()), all.size());
+        log.info("Loading session ticks for the {} most recent days of {}...", recent.size(), cfg.symbol());
 
         List<DayTicks> loaded;
         try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
             loaded = recent.stream()
-                    .map(d -> exec.submit(() -> repo.loadWindow(d,
+                    .map(d -> exec.submit(() -> source.loadWindow(d,
                             d.startMsInclusive() + PriceMoveAnalyzer.SESSION_START_SEC * 1000L,
                             d.startMsInclusive() + PriceMoveAnalyzer.SESSION_END_SEC   * 1000L)))
                     .toList()
-                    .stream().map(f -> { try { return f.get(); } catch (Exception e) { throw new RuntimeException(e); } })
+                    .stream().map(ShredderMain::join)
                     .filter(dt -> dt.size() > 0)
                     .sorted(Comparator.comparing(DayTicks::date).reversed())
                     .toList();
         }
 
-        // ---- pick newest-first until we have ~targetBars, build bars + the live model ----
+        // ---- bars + live model: newest-first until ~targetBars ----
         var selectedDays = new ArrayList<DayTicks>();
         var allBars      = new ArrayList<List<CandleBar>>();
         int barCount = 0;
@@ -70,7 +71,7 @@ public final class ShredderMain {
             selectedDays.add(dt);
             allBars.add(bars);
             barCount += bars.size();
-            if (barCount >= targetBars) break;
+            if (barCount >= cfg.targetBars()) break;
         }
 
         var liveProfile = new PriceMoveProfile("LIVE", 0);
@@ -79,31 +80,42 @@ public final class ShredderMain {
         log.info("Built live model from {} days ({} distinct changes); shredding {} bars.",
                 selectedDays.size(), String.format("%,d", liveProfile.totalChanges()), barCount);
 
-        // ---- shred every bar; analyze the shredded ticks back into a profile ----
+        // ---- shred every day's bars (parallel), keeping each day's shredded ticks ----
         var model    = TickModel.from(liveProfile);
         var shredder = new TickShredder(model);
 
-        var shreddedProfile = new PriceMoveProfile("SHREDDED", 0);
+        List<DayTicks> shreddedDays;
         try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
-            var futures = new ArrayList<java.util.concurrent.Future<PriceMoveProfile>>();
-            for (List<CandleBar> bars : allBars) {
-                if (bars.isEmpty()) continue;
-                long seed = bars.get(0).date().toEpochDay() * 1_000_003L + bars.size();
-                futures.add(exec.submit(() -> shredAndAnalyze(bars, shredder, analyzer, new SplittableRandom(seed))));
-            }
-            for (var f : futures) shreddedProfile.merge(f.get());
+            shreddedDays = allBars.stream()
+                    .filter(bars -> !bars.isEmpty())
+                    .map(bars -> {
+                        long seed = bars.get(0).date().toEpochDay() * 1_000_003L + bars.size();
+                        return exec.submit(() -> shred(bars, shredder, new SplittableRandom(seed)));
+                    })
+                    .toList()
+                    .stream().map(ShredderMain::join)
+                    .toList();
         }
+
+        // ---- verify: analyse the shredded ticks back into a profile ----
+        var shreddedProfile = new PriceMoveProfile("SHREDDED", 0);
+        for (DayTicks dt : shreddedDays) shreddedProfile.merge(analyzer.analyze(dt));
+
+        // ---- save: write every shredded tick to the output database ----
+        output.resetOutput();
+        long rowsWritten = 0;
+        for (DayTicks dt : shreddedDays) rowsWritten += output.write(dt);
 
         // ---- report ----
         log.info("========== LIVE model ==========\n{}", liveProfile.report());
         log.info("========== SHREDDED model ==========\n{}", shreddedProfile.report());
-
         Validation.compare(liveProfile, shreddedProfile);
+        log.info("Saved {} shredded ticks for {} to {}",
+                String.format("%,d", rowsWritten), cfg.symbol(), cfg.outputDb());
     }
 
-    /** Shred one day's bars into a tick stream and run the analyzer over it. */
-    private static PriceMoveProfile shredAndAnalyze(List<CandleBar> bars, TickShredder shredder,
-                                                    PriceMoveAnalyzer analyzer, SplittableRandom rng) {
+    /** Shred one day's bars into a single time-ordered {@link DayTicks} (cumulative volume). */
+    private static DayTicks shred(List<CandleBar> bars, TickShredder shredder, SplittableRandom rng) {
         var events = new ArrayList<TickShredder.ShredEvents>(bars.size());
         int total = 0;
         for (CandleBar bar : bars) {
@@ -127,12 +139,71 @@ public final class ShredderMain {
                 idx++;
             }
         }
-        return analyzer.analyze(new DayTicks(bars.get(0).date(), ts, ltp, vol, oi, total));
+        return new DayTicks(bars.get(0).date(), ts, ltp, vol, oi, total);
+    }
+
+    private static <T> T join(Future<T> f) {
+        try {
+            return f.get();
+        } catch (Exception e) {
+            throw new IllegalStateException("Task join failed", e);
+        }
     }
 
     private ShredderMain() {}
 
-    // ---------------------------------------------------------------------------------------------
+    // =============================================================================================
+
+    /**
+     * Run configuration, loaded from a {@code .properties} file. Resolution: a path given on the
+     * command line is read from disk; otherwise the bundled {@code shred.properties} on the classpath
+     * is used. Missing keys take the defaults below, so a partial file (or none) still runs.
+     */
+    record ShredConfig(String sourceDb, String outputDb, String symbol, int days, int targetBars) {
+
+        private static final String DEFAULT_SOURCE_DB = "C:/novaquant/data/sqlite/nifty_ticks.db";
+        private static final String DEFAULT_OUTPUT_DB = "C:/novaquant/data/sqlite/nifty_ticks_shredded.db";
+        private static final String DEFAULT_SYMBOL    = "NIFTY-1";
+        private static final int    DEFAULT_DAYS        = 18;
+        private static final int    DEFAULT_TARGET_BARS = 5000;
+        private static final String CLASSPATH_RESOURCE  = "shred.properties";
+
+        static ShredConfig load(String path) {
+            var props = new Properties();
+            if (path != null) {
+                try (InputStream in = Files.newInputStream(Path.of(path))) {
+                    props.load(in);
+                } catch (IOException e) {
+                    throw new IllegalArgumentException("Cannot read config file: " + path, e);
+                }
+            } else {
+                try (InputStream in = ShredConfig.class.getClassLoader().getResourceAsStream(CLASSPATH_RESOURCE)) {
+                    if (in != null) props.load(in);
+                } catch (IOException e) {
+                    throw new IllegalStateException("Cannot read bundled " + CLASSPATH_RESOURCE, e);
+                }
+            }
+            return new ShredConfig(
+                    props.getProperty("source.db", DEFAULT_SOURCE_DB).trim(),
+                    props.getProperty("output.db", DEFAULT_OUTPUT_DB).trim(),
+                    props.getProperty("symbol", DEFAULT_SYMBOL).trim(),
+                    parseInt(props, "days", DEFAULT_DAYS),
+                    parseInt(props, "target.bars", DEFAULT_TARGET_BARS));
+        }
+
+        private static int parseInt(Properties props, String key, int dflt) {
+            String v = props.getProperty(key);
+            if (v == null || v.isBlank()) return dflt;
+            try {
+                return Integer.parseInt(v.trim());
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("Config '%s' is not an integer: %s".formatted(key, v), e);
+            }
+        }
+    }
+
+    // =============================================================================================
+
     /** Side-by-side comparison of the live vs shredded behaviours, with pass/fail flags. */
     private static final class Validation {
 
@@ -153,12 +224,12 @@ public final class ShredderMain {
             row("changes/min  p99",     lc.percentile(99), sc.percentile(99), 20);
             row("changes/min  avg",     live.changesPerMinAvgValue(), shred.changesPerMinAvgValue(), 15);
 
-            Histogram lb = live.absRetBpsHist(), sb = shred.absRetBpsHist();
-            row("|move| bps  median",   lb.percentile(50), sb.percentile(50), 15);
-            row("|move| bps  p90",      lb.percentile(90), sb.percentile(90), 15);
-            row("|move| bps  p99",      lb.percentile(99), sb.percentile(99), 20);
-            row("|move| bps  mean",     lb.mean(),         sb.mean(),         15);
-            row("|move| bps  sd",       lb.stdDev(),       sb.stdDev(),       20);
+            Histogram lb = live.absRetBpsHist(), sbh = shred.absRetBpsHist();
+            row("|move| bps  median",   lb.percentile(50), sbh.percentile(50), 15);
+            row("|move| bps  p90",      lb.percentile(90), sbh.percentile(90), 15);
+            row("|move| bps  p99",      lb.percentile(99), sbh.percentile(99), 20);
+            row("|move| bps  mean",     lb.mean(),         sbh.mean(),         15);
+            row("|move| bps  sd",       lb.stdDev(),       sbh.stdDev(),       20);
 
             Histogram lp = live.absMovePtsHist(), sp = shred.absMovePtsHist();
             row("|move| pts  median",   lp.percentile(50), sp.percentile(50), 15);

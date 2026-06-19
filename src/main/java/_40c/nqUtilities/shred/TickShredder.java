@@ -1,27 +1,23 @@
-package _40c.nqUtilities.daily.shred;
+package _40c.nqUtilities.shred;
 
 import java.util.random.RandomGenerator;
 
 /**
- * Shreds a single 1-minute {@link CandleBar} into a tick-level price path that obeys the bar's
- * hard constraints and mimics live NIFTY-1 behaviour drawn from a {@link TickModel}.
+ * Shreds a single 1-minute {@link CandleBar} into a tick-level price path that obeys the bar's hard
+ * constraints and mimics live behaviour drawn from a {@link TickModel}.
  *
- * <p><b>Hard constraints (always satisfied):</b> path starts at O, ends at C, its maximum equals
- * H and minimum equals L, it never leaves {@code [L, H]}, every price sits on the 0.05 grid, and
- * the per-tick traded volume sums to the bar's volume.
+ * <p><b>Hard constraints (always satisfied):</b> path starts at O, ends at C, its maximum equals H
+ * and minimum equals L, it never leaves {@code [L, H]}, every price sits on the 0.05 grid, and the
+ * per-tick traded volume sums to the bar's volume.
  *
  * <p><b>Soft behaviour (sampled):</b> the number of distinct changes (per intraday bucket), the
- * per-tick % move (basis points), direction reversals (mean-reversion), intra-minute timing, and
- * volume spread.
+ * per-tick % move (basis points), direction reversals (mean-reversion), intra-minute timing, volume.
  *
  * <p><b>Method:</b> waypoints {@code O → E1 → E2 → C} with {@code {E1,E2}={H,L}} guarantee both
  * extremes are touched; clamping to {@code [L,H]} guarantees containment. The N changes are split
  * across the three segments by distance, and each segment is a Markov-sign random walk (reversal
- * probability from the model, magnitudes from the bps distribution) with a Brownian-bridge
- * correction that lands it exactly on the waypoint.
- *
- * <p>The first emitted tick is the bar's open (so even a flat minute is "active" with zero changes,
- * matching how the analyzer counts minutes). Stateless and thread-safe; the caller supplies the RNG.
+ * probability from the model, magnitudes from the bps distribution) with a Brownian-bridge correction
+ * that lands it exactly on the waypoint. Stateless and thread-safe; the caller supplies the RNG.
  */
 public final class TickShredder {
 
@@ -30,13 +26,13 @@ public final class TickShredder {
         public int size() { return tsMs.length; }
     }
 
-    private static final double TICK   = TickModel.TICK;
-    private static final long   POLL   = 250;          // ms grid the live feed samples on
-    private static final long   WINDOW = 60_000 - POLL;// usable span inside the minute
+    static final double TICK = 0.05;
+    private static final long POLL   = 250;            // ms grid the live feed samples on
+    private static final long WINDOW = 60_000 - POLL;  // usable span inside the minute
 
     /**
-     * Calibration: the waypoint steering forces short directional runs near the end of each leg,
-     * which suppresses the observed reversal rate by a few points. We over-set the Markov reversal
+     * Calibration: waypoint steering forces short directional runs near the end of each leg, which
+     * suppresses the observed reversal rate by a few points. We over-set the Markov reversal
      * probability by this factor so the net reversal rate lands on the live model's value.
      */
     private static final double REVERSAL_BOOST = 1.15;
@@ -95,10 +91,8 @@ public final class TickShredder {
         return new ShredEvents(ts, ltp, traded);
     }
 
-    /** Median |move| in bps from the model, used only to size the feasibility floor. */
+    /** Median |move| in bps, used only to size the feasibility floor (conservative ~1 bps constant). */
     private double medianBps() {
-        // sample-free proxy: ask the model's distribution via a fixed mid draw is not possible here,
-        // so use a conservative constant aligned with the observed ~1 bps median.
         return 1.0;
     }
 
@@ -126,15 +120,12 @@ public final class TickShredder {
     }
 
     /**
-     * Fills {@code out[off..off+k)} with a price walk from {@code a} to exactly {@code b}.
-     *
-     * <p>Magnitudes are sampled from the live bps distribution and left <em>untouched</em>, so the
-     * per-tick move distribution (median included) is preserved. The sign is a Markov mean-reverting
-     * choice (reversal probability from the model) while the walk has room, but as the remaining
-     * steps run low relative to the distance still to cover ("schedule pressure"), it is increasingly
-     * steered toward {@code b}. This produces oscillation in the middle of a leg and directional runs
-     * near its end — like real price discovery — and lands on the waypoint with only the final step pinned.
-     * Clamped to {@code [lo,hi]} (the bar's range) and snapped to the 0.05 grid throughout.
+     * Fills {@code out[off..off+k)} with a price walk from {@code a} to exactly {@code b}. Magnitudes
+     * are sampled from the live bps distribution and left untouched (so the per-tick move distribution
+     * is preserved). The sign is a Markov mean-reverting choice while the walk has room, but as the
+     * remaining steps run low relative to the distance still to cover ("schedule pressure") it is
+     * increasingly steered toward {@code b} — oscillation mid-leg, directional runs near its end.
+     * Clamped to {@code [lo,hi]} and snapped to the 0.05 grid throughout.
      */
     private void subWalk(double a, double b, int k, double lo, double hi, double refLevel,
                          double[] out, int off, RandomGenerator rng) {
@@ -149,8 +140,6 @@ public final class TickShredder {
             int    toward = need >= 0 ? 1 : -1;
             double pressure = Math.abs(need) / ((k - i) * mag);   // >1 ⇒ can't reach b without committing
 
-            // Mean-revert freely (keeps reversal ~live) until the leg risks missing its waypoint;
-            // only then commit to the waypoint direction.
             int markov = rng.nextDouble() < cont ? prev : -prev;
             int sign   = pressure > 1.0 ? toward : markov;
 
@@ -193,4 +182,55 @@ public final class TickShredder {
 
     private static double clamp(double x, double lo, double hi) { return x < lo ? lo : Math.min(x, hi); }
     private static double snap(double x) { return Math.round(x / TICK) * TICK; }
+}
+
+/**
+ * The behavioural model the shredder samples from, distilled from a live {@link PriceMoveProfile}.
+ * It keeps the empirical <em>distributions</em> (as samplable histograms), not just summary stats,
+ * so a shredded stream can match the live tails (p90/p99) and shape — not merely the mean.
+ */
+final class TickModel {
+
+    private final Histogram[] changesPerMinByBucket;   // [4]
+    private final Histogram   absMoveBps;
+    private final Histogram   gapMs;
+    private final double      reversalProb;            // 0..1
+    private final double      volPerChangeMean;
+
+    private TickModel(Histogram[] cpm, Histogram absMoveBps, Histogram gapMs,
+                      double reversalProb, double volPerChangeMean) {
+        this.changesPerMinByBucket = cpm;
+        this.absMoveBps            = absMoveBps;
+        this.gapMs                 = gapMs;
+        this.reversalProb          = reversalProb;
+        this.volPerChangeMean      = volPerChangeMean;
+    }
+
+    static TickModel from(PriceMoveProfile live) {
+        Histogram[] cpm = new Histogram[4];
+        for (int b = 0; b < 4; b++) cpm[b] = live.bucketChangesPerMin(b);
+        return new TickModel(cpm, live.absRetBpsHist(), live.gapMsHist(),
+                live.reversalRate() / 100.0, live.volPerChangeMean());
+    }
+
+    /** Number of distinct price changes to emit for a minute in the given bucket (>= 0). */
+    int sampleChangeCount(int bucket, RandomGenerator rng) {
+        double v = changesPerMinByBucket[bucket].sample(rng);
+        return Double.isNaN(v) ? 0 : Math.max(0, (int) Math.round(v));
+    }
+
+    /** A |% move| in basis points, drawn from the live distribution. */
+    double sampleAbsMoveBps(RandomGenerator rng) {
+        double v = absMoveBps.sample(rng);
+        return Double.isNaN(v) ? 0 : Math.max(0, v);
+    }
+
+    /** A gap (ms) between consecutive changes, drawn from the live distribution. */
+    double sampleGapMs(RandomGenerator rng) {
+        double v = gapMs.sample(rng);
+        return Double.isNaN(v) ? 250 : Math.max(0, v);
+    }
+
+    double reversalProb()     { return reversalProb; }
+    double volPerChangeMean() { return volPerChangeMean; }
 }
