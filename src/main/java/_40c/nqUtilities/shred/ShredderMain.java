@@ -139,10 +139,20 @@ public final class ShredderMain {
 
         var shreddedDays = shredAll(days, shredder);
 
-        var output = new TickStore(cfg.outputDb(), cfg.symbol());
-        output.resetOutput();
-        long rows = 0;
-        for (DayTicks dt : shreddedDays) rows += output.write(dt);
+        long rows;
+        String dest;
+        if ("csv".equals(cfg.outputFormat())) {
+            Path csv = Path.of(cfg.outputDir(), cfg.csvTicker() + "_" + rangeLabel(cfg) + ".csv");
+            rows = new CsvTickWriter(csv, cfg.csvTicker()).write(shreddedDays);
+            dest = csv.toAbsolutePath().toString();
+        } else {
+            var output = new TickStore(cfg.outputDb(), cfg.symbol());
+            output.resetOutput();
+            long r = 0;
+            for (DayTicks dt : shreddedDays) r += output.write(dt);
+            rows = r;
+            dest = cfg.outputDb();
+        }
 
         var analyzer        = new PriceMoveAnalyzer();
         var shreddedProfile = new PriceMoveProfile("SHREDDED", 0);
@@ -151,7 +161,16 @@ public final class ShredderMain {
         log.info("========== LIVE model (frozen) ==========\n{}", loaded.report());
         log.info("========== SHREDDED model ==========\n{}", shreddedProfile.report());
         Validation.compare(loaded, shreddedProfile);
-        log.info("Saved {} shredded ticks for {} to {}", fmt(rows), cfg.symbol(), cfg.outputDb());
+        log.info("Saved {} shredded ticks for {} to {}", fmt(rows), cfg.csvTicker(), dest);
+    }
+
+    /** Filename-safe label for the shred range: {@code from_to}, or {@code all} when unbounded. */
+    private static String rangeLabel(ShredConfig cfg) {
+        boolean hasFrom = !cfg.from().isBlank(), hasTo = !cfg.to().isBlank();
+        if (hasFrom && hasTo) return cfg.from() + "_" + cfg.to();
+        if (hasFrom)          return "from_" + cfg.from();
+        if (hasTo)            return "to_" + cfg.to();
+        return "all";
     }
 
     // ============================================================================ shared steps
@@ -289,7 +308,8 @@ public final class ShredderMain {
     record ShredConfig(String mode, String sourceType, String sourceDb, String queueDir,
                        String outputDb, String symbol, int days, int targetBars, String modelFile,
                        String candleDb, String candleSymbol, String from, String to,
-                       int minDistinctPrices, int learnSessionEndSec) {
+                       int minDistinctPrices, int learnSessionEndSec,
+                       String outputFormat, String outputDir, String csvTicker) {
 
         private static final String DEFAULT_MODE        = "selftest";
         private static final String DEFAULT_SOURCE_TYPE = "sqlite";
@@ -303,6 +323,9 @@ public final class ShredderMain {
         private static final String DEFAULT_MODEL_FILE   = "model/nifty1.profile.json";
         private static final String DEFAULT_CANDLE_DB    = "D:/Softwares/sqlite/nifty.db";
         private static final String DEFAULT_CANDLE_SYMBOL = "NIFTY";
+        private static final String DEFAULT_OUTPUT_FORMAT = "sqlite";   // shred output sink: sqlite | csv
+        private static final String DEFAULT_OUTPUT_DIR    = "F:/NIFTY Data/Tick Data";
+        private static final String DEFAULT_CSV_TICKER    = "NIFTY";
         private static final String CLASSPATH_RESOURCE   = "shred.properties";
 
         static ShredConfig load(String path) {
@@ -336,7 +359,10 @@ public final class ShredderMain {
                     props.getProperty("to", "").trim(),
                     parseInt(props, "learn.min.distinct.prices", DEFAULT_MIN_DISTINCT_PRICES),
                     parseSecOfDay(props.getProperty("learn.session.end", ""),
-                            PriceMoveAnalyzer.SESSION_END_SEC));
+                            PriceMoveAnalyzer.SESSION_END_SEC),
+                    props.getProperty("output.format", DEFAULT_OUTPUT_FORMAT).trim().toLowerCase(),
+                    props.getProperty("output.dir", DEFAULT_OUTPUT_DIR).trim(),
+                    props.getProperty("csv.ticker", DEFAULT_CSV_TICKER).trim());
         }
 
         /** Parses an {@code HH:mm} IST time to second-of-day; blank/unset returns {@code dflt}. */
